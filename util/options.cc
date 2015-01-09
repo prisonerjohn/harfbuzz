@@ -29,6 +29,22 @@
 #ifdef HAVE_FREETYPE
 #include <hb-ft.h>
 #endif
+#ifdef HAVE_OT
+#include <hb-ot-font.h>
+#endif
+
+struct supported_font_funcs_t {
+	char name[4];
+	void (*func) (hb_font_t *);
+} supported_font_funcs[] =
+{
+#ifdef HAVE_FREETYPE
+  {"ft",	hb_ft_font_set_funcs},
+#endif
+#ifdef HAVE_OT
+  {"ot",	hb_ot_font_set_funcs},
+#endif
+};
 
 
 void
@@ -244,8 +260,8 @@ view_options_t::add_options (option_parser_t *parser)
   GOptionEntry entries[] =
   {
     {"annotate",	0, 0, G_OPTION_ARG_NONE,	&this->annotate,		"Annotate output rendering",				NULL},
-    {"background",	0, 0, G_OPTION_ARG_STRING,	&this->back,			"Set background color (default: " DEFAULT_BACK ")",	"red/#rrggbb/#rrggbbaa"},
-    {"foreground",	0, 0, G_OPTION_ARG_STRING,	&this->fore,			"Set foreground color (default: " DEFAULT_FORE ")",	"red/#rrggbb/#rrggbbaa"},
+    {"background",	0, 0, G_OPTION_ARG_STRING,	&this->back,			"Set background color (default: " DEFAULT_BACK ")",	"rrggbb/rrggbbaa"},
+    {"foreground",	0, 0, G_OPTION_ARG_STRING,	&this->fore,			"Set foreground color (default: " DEFAULT_FORE ")",	"rrggbb/rrggbbaa"},
     {"line-space",	0, 0, G_OPTION_ARG_DOUBLE,	&this->line_space,		"Set space between lines (default: 0)",			"units"},
     {"margin",		0, 0, G_OPTION_ARG_CALLBACK,	(gpointer) &parse_margin,	"Margin around output (default: " G_STRINGIFY(DEFAULT_MARGIN) ")","one to four numbers"},
     {"font-size",	0, 0, G_OPTION_ARG_DOUBLE,	&this->font_size,		"Font size (default: " G_STRINGIFY(DEFAULT_FONT_SIZE) ")","size"},
@@ -267,7 +283,7 @@ shape_options_t::add_options (option_parser_t *parser)
 			      G_OPTION_ARG_CALLBACK,	(gpointer) &list_shapers,	"List available shapers and quit",	NULL},
     {"shaper",		0, G_OPTION_FLAG_HIDDEN,
 			      G_OPTION_ARG_CALLBACK,	(gpointer) &parse_shapers,	"Hidden duplicate of --shapers",	NULL},
-    {"shapers",		0, 0, G_OPTION_ARG_CALLBACK,	(gpointer) &parse_shapers,	"Comma-separated list of shapers to try","list"},
+    {"shapers",		0, 0, G_OPTION_ARG_CALLBACK,	(gpointer) &parse_shapers,	"Set comma-separated list of shapers to try","list"},
     {"direction",	0, 0, G_OPTION_ARG_STRING,	&this->direction,		"Set text direction (default: auto)",	"ltr/rtl/ttb/btt"},
     {"language",	0, 0, G_OPTION_ARG_STRING,	&this->language,		"Set text language (default: $LANG)",	"langstr"},
     {"script",		0, 0, G_OPTION_ARG_STRING,	&this->script,			"Set text script (default: auto)",	"ISO-15924 tag"},
@@ -288,7 +304,9 @@ shape_options_t::add_options (option_parser_t *parser)
   const gchar *features_help = "Comma-separated list of font features\n"
     "\n"
     "    Features can be enabled or disabled, either globally or limited to\n"
-    "    specific character ranges.\n"
+    "    specific character ranges.  The format for specifying feature settings\n"
+    "    follows.  All valid CSS font-feature-settings values other than 'normal'\n"
+    "    and 'inherited' are also accepted, though, not documented below.\n"
     "\n"
     "    The range indices refer to the positions between Unicode characters,\n"
     "    unless the --utf8-clusters is provided, in which case range indices\n"
@@ -334,10 +352,28 @@ shape_options_t::add_options (option_parser_t *parser)
 void
 font_options_t::add_options (option_parser_t *parser)
 {
+  char *text = NULL;
+
+  {
+    ASSERT_STATIC (ARRAY_LENGTH_CONST (supported_font_funcs) > 0);
+    GString *s = g_string_new (NULL);
+    g_string_printf (s, "Set font functions implementation to use (default: %s)\n\n    Supported font function implementations are: %s",
+		     supported_font_funcs[0].name,
+		     supported_font_funcs[0].name);
+    for (unsigned int i = 1; i < ARRAY_LENGTH (supported_font_funcs); i++)
+    {
+      g_string_append_c (s, '/');
+      g_string_append (s, supported_font_funcs[i].name);
+    }
+    text = g_string_free (s, FALSE);
+    parser->free_later (text);
+  }
+
   GOptionEntry entries[] =
   {
-    {"font-file",	0, 0, G_OPTION_ARG_STRING,	&this->font_file,		"Font file-name",					"filename"},
-    {"face-index",	0, 0, G_OPTION_ARG_INT,		&this->face_index,		"Face index (default: 0)",                              "index"},
+    {"font-file",	0, 0, G_OPTION_ARG_STRING,	&this->font_file,		"Set font file-name",			"filename"},
+    {"face-index",	0, 0, G_OPTION_ARG_INT,		&this->face_index,		"Set face index (default: 0)",		"index"},
+    {"font-funcs",	0, 0, G_OPTION_ARG_STRING,	&this->font_funcs,		text,					"format"},
     {NULL}
   };
   parser->add_group (entries,
@@ -373,7 +409,12 @@ output_options_t::add_options (option_parser_t *parser)
   if (NULL == supported_formats)
     text = "Set output format";
   else
-    text = g_strdup_printf ("Set output format\n\n    Supported formats are: %s", supported_formats);
+  {
+    char *items = g_strjoinv ("/", const_cast<char **> (supported_formats));
+    text = g_strdup_printf ("Set output format\n\n    Supported output formats are: %s", items);
+    g_free (items);
+    parser->free_later ((char *) text);
+  }
 
   GOptionEntry entries[] =
   {
@@ -436,11 +477,11 @@ font_options_t::get_font (void) const
 	font_data = g_mapped_file_get_contents (mf);
 	len = g_mapped_file_get_length (mf);
 	if (len) {
-	  destroy = (hb_destroy_func_t) g_mapped_file_free;
+	  destroy = (hb_destroy_func_t) g_mapped_file_unref;
 	  user_data = (void *) mf;
 	  mm = HB_MEMORY_MODE_READONLY_MAY_MAKE_WRITABLE;
 	} else
-	  g_mapped_file_free (mf);
+	  g_mapped_file_unref (mf);
       } else {
 	fail (false, "%s", error->message);
 	//g_error_free (error);
@@ -477,9 +518,37 @@ font_options_t::get_font (void) const
   hb_font_set_scale (font, upem, upem);
   hb_face_destroy (face);
 
-#ifdef HAVE_FREETYPE
-  hb_ft_font_set_funcs (font);
-#endif
+  void (*set_font_funcs) (hb_font_t *) = NULL;
+  if (!font_funcs)
+  {
+    set_font_funcs = supported_font_funcs[0].func;
+  }
+  else
+  {
+    for (unsigned int i = 0; i < ARRAY_LENGTH (supported_font_funcs); i++)
+      if (0 == strcasecmp (font_funcs, supported_font_funcs[i].name))
+      {
+	set_font_funcs = supported_font_funcs[i].func;
+	break;
+      }
+    if (!set_font_funcs)
+    {
+      GString *s = g_string_new (NULL);
+      for (unsigned int i = 0; i < ARRAY_LENGTH (supported_font_funcs); i++)
+      {
+        if (i)
+	  g_string_append_c (s, '/');
+	g_string_append (s, supported_font_funcs[i].name);
+      }
+      char *p = g_string_free (s, FALSE);
+      fail (false, "Unknown font function implementation `%s'; supported values are: %s; default is %s",
+	    font_funcs,
+	    p,
+	    supported_font_funcs[0].name);
+      //free (p);
+    }
+  }
+  set_font_funcs (font);
 
   return font;
 }

@@ -24,9 +24,6 @@
  * Google Author(s): Behdad Esfahbod
  */
 
-#define _WIN32_WINNT 0x0600
-#define WIN32_LEAN_AND_MEAN
-
 #define HB_SHAPER uniscribe
 #include "hb-shaper-impl-private.hh"
 
@@ -44,6 +41,12 @@
 #ifndef HB_DEBUG_UNISCRIBE
 #define HB_DEBUG_UNISCRIBE (HB_DEBUG+0)
 #endif
+
+
+static inline uint16_t hb_uint16_swap (const uint16_t v)
+{ return (v >> 8) | (v << 8); }
+static inline uint32_t hb_uint32_swap (const uint32_t v)
+{ return (hb_uint16_swap (v) << 16) | hb_uint16_swap (v >> 16); }
 
 
 typedef HRESULT (WINAPI *SIOT) /*ScriptItemizeOpenType*/(
@@ -248,7 +251,7 @@ retry:
       goto retry;
     }
 
-#ifdef HAVE_ATEXIT
+#ifdef HB_USE_ATEXIT
     atexit (free_uniscribe_funcs); /* First person registers atexit() callback. */
 #endif
   }
@@ -313,6 +316,7 @@ _hb_generate_unique_face_name (wchar_t *face_name, unsigned int *plen)
   const char *enc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
   UUID id;
   UuidCreate ((UUID*) &id);
+  ASSERT_STATIC (2 + 3 * (16/2) < LF_FACESIZE);
   unsigned int name_str_len = 0;
   face_name[name_str_len++] = 'F';
   face_name[name_str_len++] = '_';
@@ -379,7 +383,7 @@ _hb_rename_font (hb_blob_t *blob, wchar_t *new_name)
     OT::NameRecord &record = name.nameRecord[i];
     record.platformID.set (3);
     record.encodingID.set (1);
-    record.languageID.set (0x0409); /* English */
+    record.languageID.set (0x0409u); /* English */
     record.nameID.set (name_IDs[i]);
     record.length.set (name_str_len * 2);
     record.offset.set (0);
@@ -631,7 +635,7 @@ _hb_uniscribe_shape (hb_shape_plan_t    *shape_plan,
       event->start = false;
       event->feature = feature;
     }
-    feature_events.sort ();
+    feature_events.qsort ();
     /* Add a strategic final event. */
     {
       active_feature_t feature;
@@ -663,7 +667,7 @@ _hb_uniscribe_shape (hb_shape_plan_t    *shape_plan,
 
 	unsigned int offset = feature_records.len;
 
-	active_features.sort ();
+	active_features.qsort ();
 	for (unsigned int j = 0; j < active_features.len; j++)
 	{
 	  if (!j || active_features[j].rec.tagFeature != feature_records[feature_records.len - 1].tagFeature)
@@ -709,7 +713,7 @@ _hb_uniscribe_shape (hb_shape_plan_t    *shape_plan,
     for (unsigned int i = 0; i < range_records.len; i++)
     {
       range_record_t *range = &range_records[i];
-      range->props.potfRecords = feature_records.array + reinterpret_cast<unsigned int> (range->props.potfRecords);
+      range->props.potfRecords = feature_records.array + reinterpret_cast<uintptr_t> (range->props.potfRecords);
     }
   }
   else
@@ -729,34 +733,36 @@ _hb_uniscribe_shape (hb_shape_plan_t    *shape_plan,
 retry:
 
   unsigned int scratch_size;
-  char *scratch = (char *) buffer->get_scratch_buffer (&scratch_size);
-
-  /* Allocate char buffers; they all fit */
+  hb_buffer_t::scratch_buffer_t *scratch = buffer->get_scratch_buffer (&scratch_size);
 
 #define ALLOCATE_ARRAY(Type, name, len) \
   Type *name = (Type *) scratch; \
-  scratch += (len) * sizeof ((name)[0]); \
-  scratch_size -= (len) * sizeof ((name)[0]);
+  { \
+    unsigned int _consumed = DIV_CEIL ((len) * sizeof (Type), sizeof (*scratch)); \
+    assert (_consumed <= scratch_size); \
+    scratch += _consumed; \
+    scratch_size -= _consumed; \
+  }
 
 #define utf16_index() var1.u32
 
-  WCHAR *pchars = (WCHAR *) scratch;
+  ALLOCATE_ARRAY (WCHAR, pchars, buffer->len * 2);
+
   unsigned int chars_len = 0;
   for (unsigned int i = 0; i < buffer->len; i++)
   {
     hb_codepoint_t c = buffer->info[i].codepoint;
     buffer->info[i].utf16_index() = chars_len;
-    if (likely (c < 0x10000))
+    if (likely (c <= 0xFFFFu))
       pchars[chars_len++] = c;
-    else if (unlikely (c >= 0x110000))
-      pchars[chars_len++] = 0xFFFD;
+    else if (unlikely (c > 0x10FFFFu))
+      pchars[chars_len++] = 0xFFFDu;
     else {
-      pchars[chars_len++] = 0xD800 + ((c - 0x10000) >> 10);
-      pchars[chars_len++] = 0xDC00 + ((c - 0x10000) & ((1 << 10) - 1));
+      pchars[chars_len++] = 0xD800u + ((c - 0x10000u) >> 10);
+      pchars[chars_len++] = 0xDC00u + ((c - 0x10000u) & ((1 << 10) - 1));
     }
   }
 
-  ALLOCATE_ARRAY (WCHAR, wchars, chars_len);
   ALLOCATE_ARRAY (WORD, log_clusters, chars_len);
   ALLOCATE_ARRAY (SCRIPT_CHARPROP, char_props, chars_len);
 
@@ -769,17 +775,19 @@ retry:
       hb_codepoint_t c = buffer->info[i].codepoint;
       unsigned int cluster = buffer->info[i].cluster;
       log_clusters[chars_len++] = cluster;
-      if (c >= 0x10000 && c < 0x110000)
+      if (hb_in_range (c, 0x10000u, 0x10FFFFu))
 	log_clusters[chars_len++] = cluster; /* Surrogates. */
     }
   }
 
-  /* On Windows, we don't care about alignment...*/
-  unsigned int glyphs_size = scratch_size / (sizeof (WORD) +
-					     sizeof (SCRIPT_GLYPHPROP) +
-					     sizeof (int) +
-					     sizeof (GOFFSET) +
-					     sizeof (uint32_t));
+  /* The -2 in the following is to compensate for possible
+   * alignment needed after the WORD array.  sizeof(WORD) == 2. */
+  unsigned int glyphs_size = (scratch_size * sizeof (int) - 2)
+			   / (sizeof (WORD) +
+			      sizeof (SCRIPT_GLYPHPROP) +
+			      sizeof (int) +
+			      sizeof (GOFFSET) +
+			      sizeof (uint32_t));
 
   ALLOCATE_ARRAY (WORD, glyphs, glyphs_size);
   ALLOCATE_ARRAY (SCRIPT_GLYPHPROP, glyph_props, glyphs_size);
@@ -812,7 +820,7 @@ retry:
   bidi_state.uBidiLevel = HB_DIRECTION_IS_FORWARD (buffer->props.direction) ? 0 : 1;
   bidi_state.fOverrideDirection = 1;
 
-  hr = funcs->ScriptItemizeOpenType (wchars,
+  hr = funcs->ScriptItemizeOpenType (pchars,
 				     chars_len,
 				     MAX_ITEMS,
 				     &bidi_control,
@@ -887,7 +895,7 @@ retry:
 				     range_char_counts.array,
 				     range_properties.array,
 				     range_properties.len,
-				     wchars + chars_offset,
+				     pchars + chars_offset,
 				     item_chars_len,
 				     glyphs_size - glyphs_offset,
 				     /* out */
@@ -901,8 +909,7 @@ retry:
       FAIL ("ScriptShapeOpenType() set fNoGlyphIndex");
     if (unlikely (hr == E_OUTOFMEMORY))
     {
-      buffer->ensure (buffer->allocated * 2);
-      if (buffer->in_error)
+      if (unlikely (!buffer->ensure (buffer->allocated * 2)))
 	FAIL ("Buffer resize failed");
       goto retry;
     }
@@ -929,7 +936,7 @@ retry:
 				     range_char_counts.array,
 				     range_properties.array,
 				     range_properties.len,
-				     wchars + chars_offset,
+				     pchars + chars_offset,
 				     log_clusters + chars_offset,
 				     char_props + chars_offset,
 				     item_chars_len,
@@ -971,8 +978,7 @@ retry:
 
 #undef utf16_index
 
-  buffer->ensure (glyphs_len);
-  if (buffer->in_error)
+  if (unlikely (!buffer->ensure (glyphs_len)))
     FAIL ("Buffer in error");
 
 #undef FAIL
@@ -1011,4 +1017,5 @@ retry:
   /* Wow, done! */
   return true;
 }
+
 
